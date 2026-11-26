@@ -5,7 +5,8 @@
 // 所有操作只写 ~/.local/state/bclm-keeper/ 下的标记文件，由 root 守护
 // （com.bclm-keeper.daemon，每 30 秒）落地执行。守护未安装时菜单项仍可点击，但不会生效。
 //
-// 本机（MacBookPro11,3）的菜单栏停点约为「上限值 + 4」；不同机型可能不同。
+// 应用显示的电量是**真实电量**（内核原始 mAh / 满充 mAh），所以「充电上限选 70」就停在 70。
+// macOS 自己的菜单栏百分比按曲线被抬高（实测原始 76.5% 时显示 80%），两者不一致是正常的。
 import AppKit
 import IOKit.ps
 import ServiceManagement
@@ -281,10 +282,36 @@ func drawMenuBarBatteryFallback(levelPercent: Int, charging: Bool, onAC: Bool) -
 // MARK: - 电池读取（公开接口）
 
 struct BatteryInfo {
-    let percent: Int        // 与官方菜单一致的显示百分比
+    /// **真实电量**：内核的 AppleRawCurrentCapacity / MaxCapacity，也就是电池实际充了多少。
+    /// 菜单、悬停提示、图标填充一律用它，这样「充电上限选 70」就停在 70，不用换算。
+    let percent: Int
+    /// macOS 自己显示的百分比（IOPowerSources 的 Current Capacity）。它按一条曲线被抬高了：
+    /// 实测原始 76.5% 时显示 80%，满电时两者才重合。只用于和系统对照，不用于任何显示。
+    let systemPercent: Int
     let charging: Bool      // 与系统图标同口径：只看 IOPowerSources 的 "Is Charging"
     let onAC: Bool
     let minutesToFull: Int? // 系统估计的充满分钟数（仅充电时有）
+}
+
+/// 从内核的 AppleSmartBattery 服务读原始电量（当前 mAh、满充 mAh）。不需要权限，也不起子进程。
+func readRawCapacity() -> (current: Int, max: Int)? {
+    var iter: io_iterator_t = 0
+    guard IOServiceGetMatchingServices(kIOMainPortDefault,
+                                       IOServiceMatching("AppleSmartBattery"), &iter) == kIOReturnSuccess else {
+        return nil
+    }
+    defer { IOObjectRelease(iter) }
+    while true {
+        let service = IOIteratorNext(iter)
+        if service == 0 { break }
+        defer { IOObjectRelease(service) }
+        let cur = IORegistryEntryCreateCFProperty(service, "AppleRawCurrentCapacity" as CFString,
+                                                  kCFAllocatorDefault, 0)?.takeRetainedValue() as? Int
+        let max = IORegistryEntryCreateCFProperty(service, "MaxCapacity" as CFString,
+                                                  kCFAllocatorDefault, 0)?.takeRetainedValue() as? Int
+        if let cur, let max, max > 0 { return (cur, max) }
+    }
+    return nil
 }
 
 func readBattery() -> BatteryInfo? {
@@ -295,7 +322,7 @@ func readBattery() -> BatteryInfo? {
     for src in sources {
         guard let desc = IOPSGetPowerSourceDescription(blob, src)?.takeUnretainedValue() as? [String: Any],
               desc[kIOPSTypeKey] as? String == kIOPSInternalBatteryType else { continue }
-        let pct = desc["Current Capacity"] as? Int ?? 0
+        let systemPct = desc["Current Capacity"] as? Int ?? 0
         let onAC = (desc["Power Source State"] as? String) == "AC Power"
         // 键名用 IOPowerSources.h 的原始字符串（kIOPSTimeToFullKey 未导出到 Swift）。
         //
@@ -306,7 +333,14 @@ func readBattery() -> BatteryInfo? {
         // 电源变化事件驱动（见 AppDelegate）。
         let charging = desc["Is Charging"] as? Bool ?? false
         let mins = desc["Time to Full Charge"] as? Int
-        return BatteryInfo(percent: pct, charging: charging, onAC: onAC, minutesToFull: mins)
+        // 真实电量取内核原始值；万一读不到（非标准机型），退回系统显示值，至少有数可显示。
+        let pct: Int
+        if let raw = readRawCapacity() {
+            pct = Int((Double(raw.current) / Double(raw.max) * 100).rounded())
+        } else {
+            pct = systemPct
+        }
+        return BatteryInfo(percent: pct, systemPercent: systemPct, charging: charging, onAC: onAC, minutesToFull: mins)
     }
     return nil
 }
@@ -469,7 +503,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
                 menu.addItem(disabled("上限已临时解除（充满请求进行中）"))
                 _ = at
             } else {
-                menu.addItem(disabled("充电上限 \(limit) · SMC 当前值 \(cur) · 停点约 \(limit + 4)%"))
+                menu.addItem(disabled("充电上限 \(limit)%（到这个值就停）· 当前生效 \(cur)"))
             }
         } else {
             menu.addItem(disabled("bclm 未安装——无法读取 SMC 上限值"))
@@ -487,7 +521,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         }
 
         // 充电上限
-        let limitItem = NSMenuItem(title: "充电上限（菜单栏停点约为值 + 4）", action: nil, keyEquivalent: "")
+        let limitItem = NSMenuItem(title: "充电上限（最多充到这个百分比）", action: nil, keyEquivalent: "")
         let sub = NSMenu()
         sub.autoenablesItems = false
         for v in limitPresets {

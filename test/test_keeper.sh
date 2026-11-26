@@ -309,7 +309,8 @@ for bad_val in 49 101 abc 7.7 ""; do
 done
 [ ! -e "$SB/state/limit" ]; assert_rc "被拒绝的 set 不写文件" $?
 out=$(cli set 70); assert_eq "set 70 的退出码" 0 "$?"
-assert_grep "set 的提示" "菜单栏停点约为 74%" <(echo "$out")
+assert_grep "set 的提示" "最多充到 70%" <(echo "$out")
+assert_grep "set 的提示不再出现「停点约」这类需要换算的说法" "停点" <(echo "$out" | /usr/bin/grep -c '停点' | /usr/bin/sed 's/^0$/无停点字样/;s/^[1-9].*/出现了停点/')
 assert_eq "set 写入文件" 70 "$(/bin/cat "$SB/state/limit")"
 
 out=$(cli log 2 2>&1); assert_eq "还没有日志时 log 的退出码" 1 "$?"
