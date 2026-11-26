@@ -1,0 +1,106 @@
+#!/bin/bash
+# bclm-keeper：电池充电上限的日常命令，普通用户运行，不需要密码。
+# 真正写 SMC 的是 root 守护 /Library/PrivilegedHelperTools/bclm-keeper，每 2 分钟运行一次；
+# 本命令只改用户侧的状态文件，所以效果最迟 2 分钟后生效。
+set -u
+
+STATE_DIR=${BCLM_KEEPER_STATE_DIR:-$HOME/.local/state/bclm-keeper}
+BCLM=${BCLM:-/Library/PrivilegedHelperTools/bclm}
+LOG=${LOG:-/var/log/bclm-keeper.log}
+DAEMON=com.bclm-keeper.daemon
+DEFAULT_LIMIT=77
+FULL_TIMEOUT_HOURS=${FULL_TIMEOUT_HOURS:-24}
+
+usage() {
+    /bin/cat >&2 <<EOF
+用法：bclm-keeper status            查看当前状态
+      bclm-keeper full              请求一次性充满到 100%，充满后自动恢复平时上限
+      bclm-keeper cancel            取消一次性充满
+      bclm-keeper set <50-100>      设置平时上限（菜单栏停点约为该值 + 4）
+      bclm-keeper log [行数]        查看守护日志（默认 20 行）
+EOF
+    exit 64
+}
+
+read_bclm() {
+    "$BCLM" read 2>/dev/null | /usr/bin/tr -d '[:space:]'
+}
+
+cmd_status() {
+    local cur limit daemon req
+    cur=$(read_bclm)
+    limit=$(/bin/cat "$STATE_DIR/limit" 2>/dev/null | /usr/bin/tr -d '[:space:]')
+    echo "当前上限（SMC 里的 BCLM）：${cur:-读取失败}"
+    if [ -n "${limit:-}" ]; then
+        echo "平时上限设定：${limit}"
+    else
+        echo "平时上限设定：${DEFAULT_LIMIT}（默认）"
+    fi
+    echo "电池：$(/usr/bin/pmset -g batt | /usr/bin/sed -n '2p' \
+        | /usr/bin/sed -E 's/^-InternalBattery-0 \([^)]*\)[[:space:]]*//; s/ present: true//')"
+    if [ -e "$STATE_DIR/full-charge" ]; then
+        req=$(/usr/bin/stat -f '%Sm' -t '%Y-%m-%d %H:%M' "$STATE_DIR/full-charge")
+        echo "一次性充满：进行中（请求于 ${req}；${FULL_TIMEOUT_HOURS} 小时内未充满会自动恢复平时上限）"
+    else
+        echo "一次性充满：未请求"
+    fi
+    daemon=$(/bin/launchctl print "system/$DAEMON" 2>/dev/null \
+        | /usr/bin/grep -E '^[[:space:]]*(state|runs|last exit code) = ' | /usr/bin/tr -s ' \n' ' ')
+    echo "守护：${daemon:-未加载——先运行 install.sh 安装}"
+    if [ -r "$LOG" ]; then
+        echo "最近日志："
+        /usr/bin/tail -n 5 "$LOG" | /usr/bin/sed 's/^/  /'
+    fi
+}
+
+cmd_full() {
+    /bin/mkdir -p "$STATE_DIR" || return 1
+    if [ -e "$STATE_DIR/full-charge" ]; then
+        echo "已经在进行中了。"
+    else
+        : > "$STATE_DIR/full-charge" || return 1
+        echo "已请求一次性充满：最迟 2 分钟后解除上限，充满后自动恢复平时上限。"
+    fi
+    echo "随时可用 bclm-keeper cancel 取消，bclm-keeper status 查看进度。"
+}
+
+cmd_cancel() {
+    if /bin/rm -f "$STATE_DIR/full-charge"; then
+        echo "已取消：最迟 2 分钟后恢复平时上限。"
+    else
+        echo "取消失败。" >&2
+        return 1
+    fi
+}
+
+cmd_set() {
+    local v
+    v=$(echo "$1" | /usr/bin/tr -d '[:space:]')
+    case "$v" in ''|*[!0-9]*) usage ;; esac
+    if [ "$v" -lt 50 ] || [ "$v" -gt 100 ]; then
+        usage
+    fi
+    /bin/mkdir -p "$STATE_DIR" || return 1
+    echo "$v" > "$STATE_DIR/limit" || return 1
+    echo "平时上限已设为 ${v}：最迟 2 分钟后生效。菜单栏停点约为 $((v + 4))%。"
+}
+
+cmd_log() {
+    if [ ! -r "$LOG" ]; then
+        echo "还没有日志（${LOG}）。" >&2
+        return 1
+    fi
+    /usr/bin/tail -n "$1" "$LOG"
+}
+
+[ $# -ge 1 ] || usage
+cmd=$1
+shift
+case "$cmd" in
+    status) cmd_status ;;
+    full) cmd_full ;;
+    cancel) cmd_cancel ;;
+    set) [ $# -eq 1 ] || usage; cmd_set "$1" ;;
+    log) [ $# -le 1 ] || usage; cmd_log "${1:-20}" ;;
+    *) usage ;;
+esac

@@ -1,0 +1,8 @@
+# 构建产物（统一放 build/bin/，不入库）
+build/
+app/.build/
+
+# 过程文件（测试沙箱等）
+tmp/
+
+.DS_Store
