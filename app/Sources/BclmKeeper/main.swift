@@ -20,7 +20,6 @@ let limitURL = stateDir.appendingPathComponent("limit")
 let keeperLogURL = URL(fileURLWithPath: "/var/log/bclm-keeper.log")
 let daemonLabel = "com.bclm-keeper.daemon"
 let defaultLimit = 77
-let limitPresets: [Int] = [50, 60, 66, 70, 77, 80, 85, 90, 100]
 let bclmCandidates = ["/Library/PrivilegedHelperTools/bclm", "/usr/local/bin/bclm"]
 let batterySettingsURL = URL(string: "x-apple.systempreferences:com.apple.Battery-Settings.extension")
 
@@ -279,6 +278,112 @@ func drawMenuBarBatteryFallback(levelPercent: Int, charging: Bool, onAC: Bool) -
     return img
 }
 
+// MARK: - 控制中心风格滑块
+
+/// 仿控制中心「声音」滑块的自绘 slider cell，与 OfficialBatteryParts 同一思路：
+/// 只换皮，不碰交互——拖动、点击轨道跳值、无障碍（AXSlider 可调节）都仍由
+/// NSSlider/NSSliderCell 提供，本类只重写绘制。
+///
+/// 规格 2026-11-27 从系统成品截图与 Assets.car 实测（过程数据在仓库 tmp/slider-parts/，不入库）：
+///   · 轨道：胶囊形，高 22pt、圆角 11。Assets.car 里 slider-track 是颜色资产
+///     （深色 0.137 灰），经控制中心面板混合后实际呈现为 RGB(69,70,70)（截图实测），
+///     这里直接用呈现结果；浅色模式用资产里的 0.91 灰（未实测，仅兜底）。
+///     轨道是纯色平涂，用 CG 圆角矩形即可——把 slider-track-mask 素材横向拉伸会
+///     使两端圆角变形，数学上等价的胶囊反而精确。
+///   · 填充：白色胶囊，上下左右各比轨道缩 1pt（slider-fill 素材本身就是 31×20 缩进
+///     在 33×22 里），右端画到旋钮中心（边界藏在旋钮下面，视觉上由旋钮阴影圈分界）。
+///     素材若横向拉伸两端圆角同样变形，故也用 CG 绘制。
+///   · 旋钮：直径 20pt 白圆带阴影圈，用 ControlCenter.app 的 slider-knob 零件
+///     （40×40 画布自带阴影留白）。取不到时回退手绘圆+阴影。
+///   · 左端图标：与轨道同色。官方喇叭图标是挖空效果（露出轨道色），同色平涂视觉等价；
+///     且填充没盖住图标时（上限拉到最低）露出的也是轨道色，两种状态行为一致。
+final class OfficialSliderCell: NSSliderCell {
+    static let trackHeight: CGFloat = 22
+    static let knobDiameter: CGFloat = 20
+    /// 官方旋钮零件，运行时从用户本机 ControlCenter.app 读取（应用不打包）
+    static let knobImage: NSImage? = Bundle(path: OfficialBatteryParts.bundlePath)?
+        .image(forResource: "slider-knob")
+
+    /// 轨道色（也用作左端图标的颜色）：深色取截图实测值，浅色取 slider-track 资产值
+    static let trackColor = NSColor(name: nil) { appearance in
+        if appearance.bestMatch(from: [.aqua, .darkAqua]) == .darkAqua {
+            return NSColor(srgbRed: 69 / 255, green: 70 / 255, blue: 70 / 255, alpha: 1)
+        }
+        return NSColor(srgbRed: 232 / 255, green: 232 / 255, blue: 232 / 255, alpha: 1)
+    }
+
+    init(currentValue: Double, minValue minValue_: Double, maxValue maxValue_: Double,
+         target: AnyObject?, action: Selector) {
+        super.init()
+        self.minValue = minValue_
+        self.maxValue = maxValue_
+        self.doubleValue = currentValue
+        self.target = target
+        self.action = action
+    }
+
+    required init(coder: NSCoder) {
+        super.init(coder: coder)
+    }
+
+    /// 轨道矩形：在 controlView 内垂直居中、全宽（旋钮在两端可越出轨道，官方行为）
+    override func barRect(flipped: Bool) -> NSRect {
+        let f = controlView?.bounds ?? NSRect.zero
+        return NSRect(x: 0, y: (f.height - Self.trackHeight) / 2, width: f.width, height: Self.trackHeight)
+    }
+
+    /// 旋钮矩形：20pt 见方，中心随值在轨道内滑动（两端时旋钮边缘对齐轨道边缘）
+    override func knobRect(flipped: Bool) -> NSRect {
+        let bar = barRect(flipped: flipped)
+        let t = maxValue > minValue ? CGFloat((doubleValue - minValue) / (maxValue - minValue)) : 0
+        return NSRect(x: bar.minX + t * (bar.width - Self.knobDiameter),
+                      y: bar.midY - Self.knobDiameter / 2,
+                      width: Self.knobDiameter, height: Self.knobDiameter)
+    }
+
+    /// 全部自绘：轨道胶囊 → 白色填充胶囊 → 官方旋钮零件。不调 super（不走 drawBar/drawKnob）。
+    override func draw(withFrame frame: NSRect, in controlView: NSView) {
+        let track = barRect(flipped: controlView.isFlipped)
+        let knob = knobRect(flipped: controlView.isFlipped)
+
+        Self.trackColor.setFill()
+        NSBezierPath(roundedRect: track, xRadius: Self.trackHeight / 2, yRadius: Self.trackHeight / 2).fill()
+
+        // 填充：上下左右缩 1pt，右端到旋钮右缘——与官方构图一致（实测官方白条一直
+        // 延伸到旋钮右缘）：填充的右圆帽（半径 10）与旋钮圆的右半完全重合，白上叠白；
+        // 旋钮左晕淡淡压在填充上（官方同样有），右缘阴影圈压在轨道上。
+        // 若只画到旋钮中心，旋钮左半会悬在轨道色上，左晕在白条末端压出一条暗带，
+        // 看起来像填充与旋钮之间有缝隙。
+        let fillMinX = track.minX + 1
+        let fillRight = max(fillMinX, knob.maxX)
+        if fillRight > fillMinX {
+            NSColor.white.setFill()
+            NSBezierPath(roundedRect: NSRect(x: fillMinX, y: track.minY + 1,
+                                             width: fillRight - fillMinX, height: Self.trackHeight - 2),
+                         xRadius: (Self.trackHeight - 2) / 2, yRadius: (Self.trackHeight - 2) / 2).fill()
+        }
+
+        if let img = Self.knobImage {
+            img.draw(in: NSRect(x: knob.midX - img.size.width / 2,
+                                y: track.midY - img.size.height / 2,
+                                width: img.size.width, height: img.size.height))
+        } else {
+            // 回退：官方零件取不到时手绘白圆 + 阴影
+            NSGraphicsContext.saveGraphicsState()
+            let shadow = NSShadow()
+            shadow.shadowColor = NSColor.black.withAlphaComponent(0.35)
+            shadow.shadowOffset = NSSize(width: 0, height: -1)
+            shadow.shadowBlurRadius = 2
+            shadow.set()
+            NSColor.white.setFill()
+            NSBezierPath(ovalIn: NSRect(x: knob.midX - Self.knobDiameter / 2,
+                                        y: track.midY - Self.knobDiameter / 2,
+                                        width: Self.knobDiameter, height: Self.knobDiameter)).fill()
+            NSGraphicsContext.restoreGraphicsState()
+        }
+    }
+}
+
 // MARK: - 电池读取（公开接口）
 
 struct BatteryInfo {
@@ -503,7 +608,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
                 menu.addItem(disabled("上限已临时解除（充满请求进行中）"))
                 _ = at
             } else {
-                menu.addItem(disabled("充电上限 \(limit)%（到这个值就停）· 当前生效 \(cur)"))
+                let it = disabled("充电上限 \(limit)%（到这个值就停）· 当前生效 \(cur)")
+                statusLineItem = it
+                menu.addItem(it)
             }
         } else {
             menu.addItem(disabled("bclm 未安装——无法读取 SMC 上限值"))
@@ -520,17 +627,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
             menu.addItem(action("立即充满到 100%", #selector(doRequestFull(_:))))
         }
 
-        // 充电上限
-        let limitItem = NSMenuItem(title: "充电上限（最多充到这个百分比）", action: nil, keyEquivalent: "")
-        let sub = NSMenu()
-        sub.autoenablesItems = false
-        for v in limitPresets {
-            let it = action(v == 100 ? "100（不限制）" : "\(v)", #selector(doSetLimit(_:)), obj: v)
-            if v == limit { it.state = .on }
-            sub.addItem(it)
-        }
-        limitItem.submenu = sub
-        menu.addItem(limitItem)
+        // 充电上限：滑块行（仿控制中心「声音」滑块）
+        menu.addItem(makeLimitSliderRow(current: limit))
         menu.addItem(.separator())
 
         // 附属入口
@@ -560,10 +658,61 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         if let menu = statusItem.menu { rebuild(menu) }
     }
 
-    @objc private func doSetLimit(_ sender: NSMenuItem) {
-        guard let v = sender.representedObject as? Int else { return }
-        writeLimit(v)
-        if let menu = statusItem.menu { rebuild(menu) }
+    // 滑块行相关：拖动时实时更新右侧百分比与状态行，停止拖动 0.35 秒后才写状态文件
+    // （守护每 30 秒才读一次，拖动过程中连续写文件没有意义）
+    private var statusLineItem: NSMenuItem?
+    private var sliderPercentLabel: NSTextField?
+    private var pendingLimitWrite: DispatchWorkItem?
+
+    /// 构造「充电上限」滑块行。样式仿控制中心的「声音」滑块（OfficialSliderCell）：
+    /// 胶囊轨道、白色填充、官方旋钮零件，左端电池符号画在轨道上（颜色同轨道），
+    /// 右端显示当前百分比。
+    private func makeLimitSliderRow(current: Int) -> NSMenuItem {
+        let row = NSMenuItem()
+        let W: CGFloat = 300, H: CGFloat = 36
+        let container = NSView(frame: NSRect(x: 0, y: 0, width: W, height: H))
+
+        // 轨道左缘与菜单标题文字左缘对齐（实测标题字形左缘距菜单窗口 ~25pt，
+        // 容器 x 直接用 25 即可对上）；右缘到 242，给百分比标签（x=W-52 起）留 6pt 间隙
+        let trackLeft: CGFloat = 25
+        let trackRight: CGFloat = W - 58
+        let slider = NSSlider(frame: NSRect(x: trackLeft, y: 0, width: trackRight - trackLeft, height: H))
+        slider.cell = OfficialSliderCell(currentValue: Double(current), minValue: 50, maxValue: 100,
+                                         target: self, action: #selector(limitSliderChanged(_:)))
+        slider.isContinuous = true
+        slider.setAccessibilityLabel("充电上限")
+        container.addSubview(slider)
+
+        // 左端电池符号：叠在轨道左端内侧（仿声音滑块的喇叭图标，颜色同轨道）
+        let icon = NSImageView(frame: NSRect(x: trackLeft + 5, y: (H - 14) / 2, width: 18, height: 14))
+        icon.image = NSImage(systemSymbolName: "battery.100", accessibilityDescription: nil)?
+            .withSymbolConfiguration(.init(pointSize: 11, weight: .medium))
+        icon.contentTintColor = OfficialSliderCell.trackColor
+        container.addSubview(icon)
+
+        // 右端百分比
+        let label = NSTextField(labelWithString: "\(current)%")
+        label.frame = NSRect(x: W - 52, y: (H - 16) / 2, width: 44, height: 16)
+        label.font = .monospacedDigitSystemFont(ofSize: 12, weight: .medium)
+        label.textColor = .secondaryLabelColor
+        label.alignment = .right
+        container.addSubview(label)
+        sliderPercentLabel = label
+
+        row.view = container
+        return row
+    }
+
+    /// 滑块拖动回调：更新显示；停止拖动后一次性写入状态文件（防抖）。
+    @objc private func limitSliderChanged(_ sender: NSSlider) {
+        let v = Int(sender.doubleValue.rounded())
+        sliderPercentLabel?.stringValue = "\(v)%"
+        let cur = readBclmValue().map(String.init) ?? "?"
+        statusLineItem?.title = "充电上限 \(v)%（到这个值就停）· 当前生效 \(cur)"
+        pendingLimitWrite?.cancel()
+        let w = DispatchWorkItem { writeLimit(v) }        // 顶层函数，按名字直接调用
+        pendingLimitWrite = w
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.35, execute: w)
     }
 
     @objc private func doOpenBatterySettings(_ sender: NSMenuItem) {
