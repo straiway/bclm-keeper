@@ -291,12 +291,30 @@ func drawMenuBarBatteryFallback(levelPercent: Int, charging: Bool, onAC: Bool) -
 ///     轨道是纯色平涂，用 CG 圆角矩形即可——把 slider-track-mask 素材横向拉伸会
 ///     使两端圆角变形，数学上等价的胶囊反而精确。
 ///   · 填充：白色胶囊，上下左右各比轨道缩 1pt（slider-fill 素材本身就是 31×20 缩进
-///     在 33×22 里），右端画到旋钮中心（边界藏在旋钮下面，视觉上由旋钮阴影圈分界）。
+///     在 33×22 里），右端画到旋钮右缘——官方构图是白条一直延伸到旋钮右缘，画到
+///     中心会让旋钮左晕在白条末端压出暗带、看起来像缝隙（2026-11-28 用户反馈）。
 ///     素材若横向拉伸两端圆角同样变形，故也用 CG 绘制。
 ///   · 旋钮：直径 20pt 白圆带阴影圈，用 ControlCenter.app 的 slider-knob 零件
 ///     （40×40 画布自带阴影留白）。取不到时回退手绘圆+阴影。
+///   · 描边：浅色模式下轨道有一圈 1pt 纯黑 @10% alpha 的细环（slider-track-outline
+///     素材逐像素实测：贴轨道外缘内侧，x0-1/y0-1 各 2px @ A26；2026-11-28 用户反馈
+///     浅色缺边线后确认）。深色变体全透明，即深色本来就没有边线。环是均匀细线，
+///     直接用 CG 描边复现——素材与轨道同尺寸但被拉伸时两端圆环会变形成尖头透镜
+///     （2026-11-28 首版就栽在这里，与上面 mask/fill 不拉伸是同一条纪律）。
 ///   · 左端图标：与轨道同色。官方喇叭图标是挖空效果（露出轨道色），同色平涂视觉等价；
 ///     且填充没盖住图标时（上限拉到最低）露出的也是轨道色，两种状态行为一致。
+///   · 填充/旋钮本色：两种外观均为 255 纯白（官方浅色截图实测素材 248 经面板呈现
+///     为 255；直接用素材值会让填充发暗，2026-11-28 修正）。
+///   · 轨道是**半透明叠加色**，不是不透明平涂（2026-11-28 用户观察：弹窗底色变化时
+///     官方轨道随之变化）：深色 = 白 15.8%（官方面板 34→轨道 69 反推 35/221），
+///     浅色 = 黑 10.7%（官方面板 234→轨道 209 反推 25/234）。两个锚点都精确复现，
+///     且底色变化时轨道像官方一样跟随。
+///   · 左端图标：**填充层上的镂空**（透出下层半透明轨道，随底色变化）——与官方
+///     一致（官方深色图标 69=轨道 69、浅色图标 211≈轨道 209）。实现：灰度亮度
+///     遮罩（白=字形）+ clip(to:mask:) + destinationOut 填充擦除。遮罩生成必须
+///     先铺白底画黑字形再 difference 反转（黑底黑字形反转后全白 → 挖成方块，
+///     2026-11-28 首版踩坑）；SF Symbol 字形在图内贴底，按字形 bbox 居中定位。
+///     用 CGContext.draw 而非 NSImage.draw 做擦除——后者会重置混合模式。
 final class OfficialSliderCell: NSSliderCell {
     static let trackHeight: CGFloat = 22
     static let knobDiameter: CGFloat = 20
@@ -304,12 +322,26 @@ final class OfficialSliderCell: NSSliderCell {
     static let knobImage: NSImage? = Bundle(path: OfficialBatteryParts.bundlePath)?
         .image(forResource: "slider-knob")
 
-    /// 轨道色（也用作左端图标的颜色）：深色取截图实测值，浅色取 slider-track 资产值
-    static let trackColor = NSColor(name: nil) { appearance in
+    /// 轨道叠加色：半透明，随底色变化（alpha 由官方面板→轨道的实测锚点反推）。
+    /// 深色：白 15.8%（面板 34 → 轨道 69）；浅色：黑 10.7%（面板 234 → 轨道 209）。
+    static let trackOverlay = NSColor(name: nil) { appearance in
+        if appearance.bestMatch(from: [.aqua, .darkAqua]) == .darkAqua {
+            return NSColor(white: 1, alpha: 35.0 / 221.0)
+        }
+        return NSColor(white: 0, alpha: 25.0 / 234.0)
+    }
+
+    /// 填充/旋钮本色：两种外观都是 255 纯白（官方浅色截图实测素材 248 经面板呈现
+    /// 为 255，深色截图实测 255）
+    static let fillColor = NSColor.white
+
+    /// 左端图标色（平涂上色用）：官方实测呈现值，深 69,70,70 / 浅 209,210,211
+    /// （与轨道呈现值一致——官方图标是挖空效果，平涂同色视觉等价）
+    static let iconColor = NSColor(name: nil) { appearance in
         if appearance.bestMatch(from: [.aqua, .darkAqua]) == .darkAqua {
             return NSColor(srgbRed: 69 / 255, green: 70 / 255, blue: 70 / 255, alpha: 1)
         }
-        return NSColor(srgbRed: 232 / 255, green: 232 / 255, blue: 232 / 255, alpha: 1)
+        return NSColor(srgbRed: 209 / 255, green: 210 / 255, blue: 211 / 255, alpha: 1)
     }
 
     init(currentValue: Double, minValue minValue_: Double, maxValue maxValue_: Double,
@@ -326,28 +358,52 @@ final class OfficialSliderCell: NSSliderCell {
         super.init(coder: coder)
     }
 
-    /// 轨道矩形：在 controlView 内垂直居中、全宽（旋钮在两端可越出轨道，官方行为）
-    override func barRect(flipped: Bool) -> NSRect {
-        let f = controlView?.bounds ?? NSRect.zero
-        return NSRect(x: 0, y: (f.height - Self.trackHeight) / 2, width: f.width, height: Self.trackHeight)
+    /// 轨道矩形：在给定矩形内垂直居中、全宽（旋钮在两端可越出轨道，官方行为）
+    private static func trackRect(in frame: NSRect) -> NSRect {
+        NSRect(x: frame.minX, y: frame.minY + (frame.height - Self.trackHeight) / 2,
+               width: frame.width, height: Self.trackHeight)
     }
 
     /// 旋钮矩形：20pt 见方，中心随值在轨道内滑动（两端时旋钮边缘对齐轨道边缘）
-    override func knobRect(flipped: Bool) -> NSRect {
-        let bar = barRect(flipped: flipped)
+    private func knobRect(in track: NSRect) -> NSRect {
         let t = maxValue > minValue ? CGFloat((doubleValue - minValue) / (maxValue - minValue)) : 0
-        return NSRect(x: bar.minX + t * (bar.width - Self.knobDiameter),
-                      y: bar.midY - Self.knobDiameter / 2,
+        return NSRect(x: track.minX + t * (track.width - Self.knobDiameter),
+                      y: track.midY - Self.knobDiameter / 2,
                       width: Self.knobDiameter, height: Self.knobDiameter)
     }
 
-    /// 全部自绘：轨道胶囊 → 白色填充胶囊 → 官方旋钮零件。不调 super（不走 drawBar/drawKnob）。
-    override func draw(withFrame frame: NSRect, in controlView: NSView) {
-        let track = barRect(flipped: controlView.isFlipped)
-        let knob = knobRect(flipped: controlView.isFlipped)
+    /// AppKit 命中测试/无障碍用的矩形：以 controlView 的 bounds 为绘图矩形。
+    /// 绘制路径（draw(withFrame:)）不经过这里——它直接用传入的 frame，
+    /// 因为 controlView 要等控件进窗口才由 AppKit 建立，绘制若依赖它会在
+    /// 早期渲染时画出零矩形（2026-11-28 离屏测试实证）。
+    override func barRect(flipped: Bool) -> NSRect {
+        Self.trackRect(in: controlView?.bounds ?? NSRect.zero)
+    }
 
-        Self.trackColor.setFill()
+    override func knobRect(flipped: Bool) -> NSRect {
+        knobRect(in: barRect(flipped: flipped))
+    }
+
+    /// 全部自绘：半透明轨道 → 官方描边 → 白色填充层（含图标镂空）→ 官方旋钮零件。
+    /// 不调 super（不走 drawBar/drawKnob）。
+    override func draw(withFrame frame: NSRect, in controlView: NSView) {
+        guard let ctx = NSGraphicsContext.current?.cgContext else { return }
+        let track = Self.trackRect(in: frame)
+        let knob = knobRect(in: track)
+
+        Self.trackOverlay.setFill()
         NSBezierPath(roundedRect: track, xRadius: Self.trackHeight / 2, yRadius: Self.trackHeight / 2).fill()
+
+        // 浅色描边：1pt 纯黑 @10%，贴轨道外缘内侧（与 slider-track-outline 素材
+        // 逐像素实测一致）。深色模式没有描边（素材深色变体全透明）。环是均匀细线，
+        // 用 CG 描边精确复现；不用拉伸素材——横向拉伸会让两端圆环变形成尖头透镜。
+        if controlView.effectiveAppearance.bestMatch(from: [.aqua, .darkAqua]) != .darkAqua {
+            NSColor.black.withAlphaComponent(0.1).setStroke()
+            let p = NSBezierPath(roundedRect: track.insetBy(dx: 0.5, dy: 0.5),
+                                 xRadius: Self.trackHeight / 2 - 0.5, yRadius: Self.trackHeight / 2 - 0.5)
+            p.lineWidth = 1
+            p.stroke()
+        }
 
         // 填充：上下左右缩 1pt，右端到旋钮右缘——与官方构图一致（实测官方白条一直
         // 延伸到旋钮右缘）：填充的右圆帽（半径 10）与旋钮圆的右半完全重合，白上叠白；
@@ -357,7 +413,7 @@ final class OfficialSliderCell: NSSliderCell {
         let fillMinX = track.minX + 1
         let fillRight = max(fillMinX, knob.maxX)
         if fillRight > fillMinX {
-            NSColor.white.setFill()
+            Self.fillColor.setFill()
             NSBezierPath(roundedRect: NSRect(x: fillMinX, y: track.minY + 1,
                                              width: fillRight - fillMinX, height: Self.trackHeight - 2),
                          xRadius: (Self.trackHeight - 2) / 2, yRadius: (Self.trackHeight - 2) / 2).fill()
@@ -375,13 +431,15 @@ final class OfficialSliderCell: NSSliderCell {
             shadow.shadowOffset = NSSize(width: 0, height: -1)
             shadow.shadowBlurRadius = 2
             shadow.set()
-            NSColor.white.setFill()
+            Self.fillColor.setFill()
             NSBezierPath(ovalIn: NSRect(x: knob.midX - Self.knobDiameter / 2,
                                         y: track.midY - Self.knobDiameter / 2,
                                         width: Self.knobDiameter, height: Self.knobDiameter)).fill()
             NSGraphicsContext.restoreGraphicsState()
         }
     }
+
+
 }
 
 // MARK: - 电池读取（公开接口）
@@ -665,7 +723,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     private var pendingLimitWrite: DispatchWorkItem?
 
     /// 构造「充电上限」滑块行。样式仿控制中心的「声音」滑块（OfficialSliderCell）：
-    /// 胶囊轨道、白色填充、官方旋钮零件，左端电池符号画在轨道上（颜色同轨道），
+    /// 半透明胶囊轨道、白色填充（左端电池符号平涂上色）、官方旋钮零件，
     /// 右端显示当前百分比。
     private func makeLimitSliderRow(current: Int) -> NSMenuItem {
         let row = NSMenuItem()
@@ -683,11 +741,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         slider.setAccessibilityLabel("充电上限")
         container.addSubview(slider)
 
-        // 左端电池符号：叠在轨道左端内侧（仿声音滑块的喇叭图标，颜色同轨道）
+        // 左端电池符号：平涂上色（色值=官方实测呈现值，深 69/浅 209，与轨道一致）
         let icon = NSImageView(frame: NSRect(x: trackLeft + 5, y: (H - 14) / 2, width: 18, height: 14))
         icon.image = NSImage(systemSymbolName: "battery.100", accessibilityDescription: nil)?
             .withSymbolConfiguration(.init(pointSize: 11, weight: .medium))
-        icon.contentTintColor = OfficialSliderCell.trackColor
+        icon.contentTintColor = OfficialSliderCell.iconColor
         container.addSubview(icon)
 
         // 右端百分比
