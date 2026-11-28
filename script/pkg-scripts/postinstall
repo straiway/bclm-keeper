@@ -1,0 +1,81 @@
+#!/bin/bash
+# BclmKeeper pkg 安装后脚本（Installer 以 root 运行）。
+# 职责：迁移旧启动项 → 按当前登录用户实例化并装载 LaunchDaemon → 修正 CLI/应用
+# 属主 → 建状态目录/日志 → 立即运行一次守护 → 打开应用。
+# 等价于 script/install.sh 的核心逻辑（install.sh 面向源码安装，本脚本面向 pkg）。
+set -eu
+
+LABEL=com.bclm-keeper.daemon
+PLIST=/Library/LaunchDaemons/$LABEL.plist
+HELPER=/Library/PrivilegedHelperTools
+TEMPLATE=$HELPER/$LABEL.plist.template
+OLD_LABEL=com.straiway.bclm-keeper
+BCLM_LABEL=com.zackelia.bclm.plist
+LOG=/var/log/bclm-keeper.log
+DB_DIR=/var/db/bclm-keeper
+
+echo "BclmKeeper 安装后配置…"
+
+# 当前登录用户（无 GUI 会话时退化为 root，仅影响状态目录位置）
+CONSOLE_UID=$(/usr/bin/stat -f %u /dev/console)
+CONSOLE_USER=$(/usr/bin/stat -f %Su /dev/console)
+home=$(/usr/bin/dscl . -read "/Users/$CONSOLE_USER" NFSHomeDirectory 2>/dev/null | /usr/bin/awk '{print $2}')
+[ -n "$home" ] || home="/Users/$CONSOLE_USER"
+state_dir=$home/.local/state/bclm-keeper
+
+# 1. root 属主兜底（payload 已设置，此处保险）
+/usr/sbin/chown root:wheel "$HELPER/bclm" "$HELPER/bclm-keeper" 2>/dev/null || true
+/bin/chmod 0755 "$HELPER/bclm" "$HELPER/bclm-keeper" 2>/dev/null || true
+
+# 2. 迁移旧启动项（本项目旧标签 + bclm 自带标签）
+if [ -e "/Library/LaunchDaemons/$OLD_LABEL.plist" ]; then
+    /bin/launchctl bootout "system/$OLD_LABEL" >/dev/null 2>&1 || true
+    /bin/rm -f "/Library/LaunchDaemons/$OLD_LABEL.plist"
+    echo "已迁移旧标签 ${OLD_LABEL} -> ${LABEL}"
+fi
+/usr/local/bin/bclm unpersist >/dev/null 2>&1 || true
+/bin/launchctl bootout "system/$BCLM_LABEL" >/dev/null 2>&1 || true
+/bin/rm -f "/Library/LaunchDaemons/$BCLM_LABEL"
+
+# 3. 按当前用户实例化 LaunchDaemon 并装载（重复安装先卸旧的）
+tmp="$PLIST.tmp"
+/usr/bin/sed "s|__STATE_DIR__|$state_dir|" "$TEMPLATE" > "$tmp"
+/usr/bin/install -o root -g wheel -m 0644 "$tmp" "$PLIST"
+/bin/rm -f "$tmp"
+/bin/launchctl bootout "system/$LABEL" >/dev/null 2>&1 || true
+/bin/launchctl bootstrap system "$PLIST"
+
+# 4. 数据库/日志（root 属主）
+/bin/mkdir -p "$DB_DIR"
+/usr/sbin/chown root:wheel "$DB_DIR"
+/bin/chmod 0755 "$DB_DIR"
+/usr/bin/touch "$LOG"
+/usr/sbin/chown root:wheel "$LOG"
+/bin/chmod 0644 "$LOG"
+
+# 5. CLI 与应用属主改为当前登录用户（install.sh 同款）
+uid="$CONSOLE_UID"
+if [ -e /usr/local/bin/bclm-keeper ]; then
+    /usr/sbin/chown "$uid":staff /usr/local/bin/bclm-keeper
+    /bin/chmod 0755 /usr/local/bin/bclm-keeper
+fi
+if [ -e /usr/local/bin/bclm ]; then
+    /usr/sbin/chown root:wheel /usr/local/bin/bclm
+    /bin/chmod 0755 /usr/local/bin/bclm
+fi
+if [ -d /Applications/BclmKeeper.app ]; then
+    /usr/sbin/chown -R "$uid":admin /Applications/BclmKeeper.app
+fi
+
+# 6. 用户状态目录
+/bin/mkdir -p "$state_dir"
+/usr/sbin/chown "$uid":staff "$state_dir"
+
+# 7. 立即运行一次守护（不必等 30 秒周期）
+"$HELPER/bclm-keeper" --state-dir "$state_dir" || true
+
+# 8. 打开菜单栏应用（尽力而为；应用为 LSUIElement，只出现在菜单栏）
+/bin/launchctl asuser "$CONSOLE_UID" /usr/bin/open -a /Applications/BclmKeeper.app >/dev/null 2>&1 || true
+
+echo "BclmKeeper 安装完成。菜单栏会出现电池图标；CLI：bclm-keeper status"
+exit 0

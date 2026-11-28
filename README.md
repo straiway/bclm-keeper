@@ -27,12 +27,26 @@
 
 ## 安装
 
+### 方式一：安装包（推荐）
+
+从 [Releases](https://github.com/straiway/bclm-keeper/releases) 下载 `BclmKeeper-<版本>.pkg` 双击安装：
+
+- 无需 Xcode/命令行，bclm 依赖已内置（zackelia/bclm，MIT）
+- 安装器会要求输入管理员密码，随后自动完成守护装载、CLI 安装并打开菜单栏应用
+- 若 Gatekeeper 拦截（「无法验证开发者」）：右键点击 pkg → 打开 → 再点安装，
+  或在终端执行 `sudo installer -pkg BclmKeeper-<版本>.pkg -target /`
+
+### 方式二：源码构建
+
 ```bash
 git clone https://github.com/straiway/bclm-keeper.git
 cd bclm-keeper
 bash script/build-app.sh                     # 编译菜单栏应用 → build/bin/BclmKeeper.app
 sudo bash script/install.sh --user $(whoami)  # 装 root 守护 + 应用 + CLI（幂等，会迁移旧标签）
+# 若未安装 zackelia/bclm，先按其 README 从源码构建并安装到 /usr/local/bin/bclm
 ```
+
+卸载：`sudo bash script/uninstall.sh --user $(whoami)`（SMC 里的值保持不变；要回到 bclm 自带开机启动项再执行 `sudo bclm persist`）。
 
 卸载：`sudo bash script/uninstall.sh --user $(whoami)`（SMC 里的值保持不变；要回到 bclm 自带开机启动项再执行 `sudo bclm persist`）。
 
