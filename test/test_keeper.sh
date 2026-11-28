@@ -1,5 +1,5 @@
 #!/bin/bash
-# keeper.sh 与 bclm-keeper 命令的离线测试：用假的 bclm / ioreg / sysctl 在临时沙箱里跑，
+# keeper.sh 与 bclm-keeper 命令的离线测试：用假的 bclm / ioreg / sysctl / date 在临时沙箱里跑，
 # 全程不碰真实 SMC，也不需要 root。用法：bash test_keeper.sh
 set -u
 
@@ -47,6 +47,15 @@ EOF
 #!/bin/bash
 echo "{ sec = $(/bin/cat "${SB_DIR:?}/boot"), usec = 0 } Mon Nov 25 00:00:00 2026"
 EOF
+
+# 假 date：epoch 取 $SB/now（模拟开机、校时、睡眠时墙钟的变化），其余格式透传真 date
+/bin/cat > "$SB/bin/date" <<'EOF'
+#!/bin/bash
+case "$1" in
+    +%s) /bin/cat "${SB_DIR:?}/now" ;;
+    *) /bin/date "$@" ;;
+esac
+EOF
 /bin/chmod 0755 "$SB/bin"/*
 
 pass=0
@@ -89,7 +98,7 @@ set_batt() {
 }
 reset() {
     # $1 = BCLM 初值；清空所有状态
-    /bin/rm -f "$SB/value" "$SB/writes" "$SB/readfail" "$SB/fail" "$SB/keeper.log" "$SB/boot" "$SB/batt"
+    /bin/rm -f "$SB/value" "$SB/writes" "$SB/readfail" "$SB/fail" "$SB/keeper.log" "$SB/boot" "$SB/now" "$SB/batt"
     /bin/rm -rf "$SB/db" "$SB/state" "$SB/uhome"
     /bin/mkdir -p "$SB/db" "$SB/state" "$SB/uhome"
     echo "$1" > "$SB/value"
@@ -104,6 +113,16 @@ run_n() {
     local i
     i=0
     while [ "$i" -lt "$1" ]; do run "${@:2}"; i=$((i + 1)); done
+}
+runt() {
+    # 同 run，但用假 date（epoch 取 $SB/now），便于模拟开机、校时、睡眠
+    env SB_DIR="$SB" BCLM="$SB/bin/bclm" IOREG="$SB/bin/ioreg" SYSCTL="$SB/bin/sysctl" \
+        DATE="$SB/bin/date" DB_DIR="$SB/db" LOG="$SB/keeper.log" "$@" /bin/bash "$KEEPER" --state-dir "$SB/state"
+}
+runt_n() {
+    local i
+    i=0
+    while [ "$i" -lt "$1" ]; do runt "${@:2}"; i=$((i + 1)); done
 }
 settle() {
     run_n 4    # 走完开机后头 3 次重写，进入平稳期
@@ -185,6 +204,53 @@ run_n 3
 assert_eq "重新开机后又是 3 次重写" 6 "$(writes)"
 run
 assert_eq "之后停止" 6 "$(writes)"
+
+echo "== 守护：开机判定（校时会平移 kern.boottime，不能只看它变没变）=="
+# 场景基础：假时间下走完一个开机周期（boot=1000、now=100000 → uptime 约 27.5 小时）
+reset 77
+echo 1000 > "$SB/boot"
+echo 100000 > "$SB/now"
+runt_n 4
+assert_eq "假时间下走完开机周期" 3 "$(writes)"
+
+# 真开机：boottime 变了且 uptime 在窗口内 → 重置计数，又是 3 次重写
+echo 5000 > "$SB/boot"; echo 5100 > "$SB/now"
+runt_n 3
+assert_eq "真开机后又是 3 次重写" 6 "$(writes)"
+runt
+assert_eq "之后停止" 6 "$(writes)"
+
+# 校时：boottime 平移了 +600，但墙钟同步平移、uptime 不变（仍在窗口外）→ 不重置、不写
+echo 5600 > "$SB/boot"; echo 104600 > "$SB/now"
+runt
+assert_eq "校时不被误判为开机" 6 "$(writes)"
+runt_n 2
+assert_eq "校时后继续平稳" 6 "$(writes)"
+
+# uptime 小幅倒退（≤ UPTIME_BACK_SECS，校时余量）不算重启；明显倒退才算
+echo 5670 > "$SB/boot"; echo 104600 > "$SB/now"    # uptime 98930，比上次记录 99000 倒退 70
+runt_n 3
+assert_eq "uptime 明显倒退判为重启，补 3 次" 9 "$(writes)"
+runt
+assert_eq "补写后停止" 9 "$(writes)"
+echo 5700 > "$SB/boot"; echo 104600 > "$SB/now"    # uptime 98900，再倒退 30
+runt
+assert_eq "小幅倒退不算重启" 9 "$(writes)"
+
+# 开机后立刻睡眠、唤醒时已出开机窗口：uptime 大倒退仍要识别为新开机
+reset 77
+echo 1000 > "$SB/boot"; echo 100000 > "$SB/now"    # 旧会话 uptime 约 27.5 小时
+runt_n 4
+echo 5000 > "$SB/boot"; echo 33900 > "$SB/now"     # 新开机 100 秒后睡着，8 小时后唤醒
+runt_n 3
+assert_eq "睡过开机窗口的唤醒仍补 3 次重写" 6 "$(writes)"
+
+# RTC 偏未来（uptime 为负）按刚开机处理
+reset 77
+settle
+echo $(( $(/bin/date +%s) + 3600 )) > "$SB/boot"
+run_n 3
+assert_eq "RTC 偏未来（uptime 为负）按刚开机处理" 6 "$(writes)"
 
 echo "== 守护：一次性充满 =="
 reset 77

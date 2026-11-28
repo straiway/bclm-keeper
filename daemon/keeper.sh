@@ -32,6 +32,8 @@ DEFAULT_LIMIT=77
 BOOT_APPLY_RUNS=3
 FULL_PERMILLE=990
 FULL_CONFIRM_RUNS=2
+BOOT_WINDOW_SECS=600
+UPTIME_BACK_SECS=60
 
 usage() {
     echo "用法：bclm-keeper --state-dir <用户状态目录>" >&2
@@ -153,11 +155,32 @@ if [ -e "$flag" ]; then
 fi
 
 # ---- 平时：自愈 + 开机后头几次重写 ----
+# 开机判定不能只看 kern.boottime 是否变化：NTP 校时会改写它（本机实测 3 天误判 5 次，
+# 每次误判多写 3 次同值）。校时让 boottime 与墙钟同步平移、uptime 保持正确，所以：
+#   - boottime 变了且 uptime 还在开机窗口内 → 真开机；
+#   - uptime 比上次记录明显倒退 → 也是真开机（覆盖开机后立刻睡眠、唤醒时已出窗口的情况）。
 boot=$(boot_id)
 case "$boot" in ''|*[!0-9]*) boot= ;; esac
-if [ -n "$boot" ] && [ "$boot" != "$(db_get boot)" ]; then
-    db_put boot "$boot"
-    db_put boot-runs 0
+uptime=
+if [ -n "$boot" ]; then
+    uptime=$(( $("$DATE" +%s) - boot ))
+    case "$uptime" in
+        *[!0-9]*) uptime=0 ;;   # 负数：RTC 偏未来、时钟尚未校准，按刚开机处理
+    esac
+fi
+if [ -n "$uptime" ]; then
+    prev=$(db_get uptime)
+    new_boot=false
+    if [ "$uptime" -lt "$BOOT_WINDOW_SECS" ] && [ "$boot" != "$(db_get boot)" ]; then
+        new_boot=true
+    elif [ $((prev - uptime)) -gt "$UPTIME_BACK_SECS" ]; then
+        new_boot=true
+    fi
+    if $new_boot; then
+        db_put boot "$boot"
+        db_put boot-runs 0
+    fi
+    db_put uptime "$uptime"
 fi
 runs=$(db_get boot-runs)
 if [ "$cur" != "$limit" ] || [ "$runs" -lt "$BOOT_APPLY_RUNS" ]; then

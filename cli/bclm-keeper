@@ -1,6 +1,6 @@
 #!/bin/bash
 # bclm-keeper：电池充电上限的日常命令，普通用户运行，不需要密码。
-# 真正写 SMC 的是 root 守护 /Library/PrivilegedHelperTools/bclm-keeper，每 2 分钟运行一次；
+# 真正写 SMC 的是 root 守护 /Library/PrivilegedHelperTools/bclm-keeper，每 30 秒运行一次；
 # 本命令只改用户侧的状态文件，所以效果最迟 30 秒后生效（守护每 30 秒检查一次）。
 set -u
 
@@ -59,14 +59,14 @@ cmd_full() {
         echo "已经在进行中了。"
     else
         : > "$STATE_DIR/full-charge" || return 1
-        echo "已请求一次性充满：最迟 2 分钟后解除上限，充满后自动恢复平时上限。"
+        echo "已请求一次性充满：最迟 30 秒后解除上限，充满后自动恢复平时上限。"
     fi
     echo "随时可用 bclm-keeper cancel 取消，bclm-keeper status 查看进度。"
 }
 
 cmd_cancel() {
     if /bin/rm -f "$STATE_DIR/full-charge"; then
-        echo "已取消：最迟 2 分钟后恢复平时上限。"
+        echo "已取消：最迟 30 秒后恢复平时上限。"
     else
         echo "取消失败。" >&2
         return 1
